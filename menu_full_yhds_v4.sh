@@ -1,6 +1,7 @@
 #!/bin/bash
 # menu_full_yhds_v4.sh
 # YHDS VPS MENU v4 - Full script (SSH, UDP-Custom, WS, Trojan, V2Ray placeholder, Telegram)
+# Includes: WILDCARD MODE support for WS/Trojan (toggleable)
 # Paste to /usr/local/bin/menu_full_yhds_v4.sh and chmod +x
 # Run as root.
 
@@ -27,6 +28,11 @@ UDP_CONF="/etc/udp-custom/server.json"
 UDP_SERVICE="/etc/systemd/system/udp-custom.service"
 MENU_PATH="/usr/local/bin/menu_full_yhds_v4.sh"
 SCREEN_NAME="yhds-menu"
+META_FILE="${YHDS_DIR}/meta.json"
+
+# defaults (wildcard off by default)
+WILDCARD_MODE="off"   # on/off
+WILDCARD_DOMAIN=""    # if set, include as SAN in self-signed cert
 
 # Helper functions
 log(){ echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -42,11 +48,23 @@ fi
 # util: detect IP
 server_ip(){ curl -s ipv4.icanhazip.com || hostname -I | awk '{print $1}'; }
 
+# persist meta
+load_meta(){
+  if [[ -f "${META_FILE}" ]]; then
+    WILDCARD_MODE=$(jq -r '.wildcard_mode // "off"' "${META_FILE}" 2>/dev/null || echo "off")
+    WILDCARD_DOMAIN=$(jq -r '.wildcard_domain // ""' "${META_FILE}" 2>/dev/null || echo "")
+  fi
+}
+save_meta(){
+  mkdir -p "$(dirname "${META_FILE}")"
+  jq -n --arg w "${WILDCARD_MODE}" --arg d "${WILDCARD_DOMAIN}" '{wildcard_mode:$w, wildcard_domain:$d}' > "${META_FILE}"
+}
+
 # ensure base deps
 ensure_deps(){
   log "Menginstall dependency dasar..."
   apt update -y
-  apt install -y wget curl jq unzip bzip2 screen git lsof netcat-openbsd openssl util-linux grep sed awk iproute2 iptables ca-certificates python3 python3-pip qrencode || true
+  apt install -y wget curl jq unzip bzip2 screen git lsof netcat-openbsd openssl util-linux grep sed awk iproute2 iptables ca-certificates python3 python3-pip qrencode figlet lolcat || true
   # install pyTelegramBotAPI if python exists and not installed
   if command -v python3 >/dev/null 2>&1; then
     python3 -m pip install --upgrade pip >/dev/null 2>&1 || true
@@ -59,31 +77,42 @@ prepare_dirs(){
   mkdir -p "${YHDS_DIR}" "${CERT_DIR}" "$(dirname "${XRAY_CONF1}")" "$(dirname "${XRAY_CONF2}")" /var/log/xray /etc/udp-custom
   touch "${USERS_CSV}" || true
   chmod 600 "${USERS_CSV}" || true
+  load_meta
 }
 
-# create self-signed cert for IP
-ensure_cert_for_ip(){
+# create self-signed cert for IP and optional domain SAN
+ensure_cert_for_ip_and_domain(){
   IP="$1"
+  DOMAIN="${2:-}"
   if [[ -f "${CERT_PEM}" && -f "${KEY_PEM}" ]]; then
-    # check SAN contains IP
-    if openssl x509 -in "${CERT_PEM}" -noout -text 2>/dev/null | grep -q "${IP}"; then
-      log "Certificate exists for ${IP}"
+    # check SAN contains IP or domain as requested
+    SAN_OK=true
+    if ! openssl x509 -in "${CERT_PEM}" -noout -text 2>/dev/null | grep -q "${IP}"; then SAN_OK=false; fi
+    if [[ -n "${DOMAIN}" && "${SAN_OK}" = true ]]; then
+      if ! openssl x509 -in "${CERT_PEM}" -noout -text 2>/dev/null | grep -q "${DOMAIN}"; then SAN_OK=false; fi
+    fi
+    if [[ "${SAN_OK}" = true ]]; then
+      log "Certificate already contains requested SAN(s)."
       return 0
     fi
   fi
-  log "Membuat self-signed TLS cert untuk IP ${IP}..."
+  log "Membuat self-signed TLS cert untuk IP ${IP} ${DOMAIN:+dan domain ${DOMAIN}}..."
+  CN="${DOMAIN:-${IP}}"
   cat > "${CERT_DIR}/openssl-ip.cnf" <<EOF
 [req]
 prompt = no
 distinguished_name = dn
 req_extensions = v3_req
 [dn]
-CN = ${IP}
+CN = ${CN}
 [v3_req]
 subjectAltName = @alt_names
 [alt_names]
 IP.1 = ${IP}
 EOF
+  if [[ -n "${DOMAIN}" ]]; then
+    echo "DNS.1 = ${DOMAIN}" >> "${CERT_DIR}/openssl-ip.cnf"
+  fi
   openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
     -keyout "${KEY_PEM}" -out "${CERT_PEM}" -config "${CERT_DIR}/openssl-ip.cnf" >/dev/null 2>&1 || true
   chmod 600 "${KEY_PEM}" || true
@@ -139,14 +168,32 @@ SVC
   rm -rf "${TMP}" || true
 }
 
-# write xray config based on /etc/yhds/users.csv
+# build clients JSON safely
+clients_json_from_csv(){
+  if [[ -f "${USERS_CSV}" ]]; then
+    awk -F, 'NF>=2{gsub(/"/,"\\\"",$2); printf "{\"password\":\""$2"\",\"email\":\""$1"\"}\n"}' "${USERS_CSV}" | jq -s '.' 2>/dev/null || echo "[]"
+  else
+    echo "[]"
+  fi
+}
+
+# write xray config based on /etc/yhds/users.csv and wildcard settings
 write_xray_config(){
   IP="$1"
-  # build clients JSON
-  if [[ -f "${USERS_CSV}" ]]; then
-    CLIENTS_JSON=$(awk -F, 'NF>=2{gsub(/"/,"\\\"",$2); printf "{\"password\":\""$2"\",\"email\":\""$1"\"}\n"}' "${USERS_CSV}" | jq -s '.' 2>/dev/null || echo "[]")
+  load_meta
+  CLIENTS_JSON="$(clients_json_from_csv)"
+
+  # decide wsSettings based on wildcard mode
+  if [[ "${WILDCARD_MODE}" == "on" ]]; then
+    # wildcard: accept any Host (no headers enforcement) and use path "/"
+    WS_SETTINGS='
+        "wsSettings": { "path": "/", "acceptProxyProtocol": false }
+    '
   else
-    CLIENTS_JSON="[]"
+    # default: path /trojan-ws and set Host header to IP for stricter match
+    WS_SETTINGS='
+        "wsSettings": { "path": "/trojan-ws", "headers": { "Host": "'${IP}'" } }
+    '
   fi
 
   cat > "${XRAY_CONF1}" <<JSON
@@ -164,8 +211,7 @@ write_xray_config(){
           "certificates": [
             { "certificateFile": "${CERT_PEM}", "keyFile": "${KEY_PEM}" }
           ]
-        },
-        "wsSettings": { "path": "/trojan-ws", "headers": { "Host": "${IP}" } }
+        },${WS_SETTINGS}
       }
     },
     {
@@ -192,7 +238,7 @@ JSON
   mkdir -p "$(dirname "${XRAY_CONF2}")"
   cp -f "${XRAY_CONF1}" "${XRAY_CONF2}" 2>/dev/null || true
   chmod 644 "${XRAY_CONF1}" "${XRAY_CONF2}" 2>/dev/null || true
-  log "Xray config ditulis ke ${XRAY_CONF1} (dan ${XRAY_CONF2})."
+  log "Xray config ditulis ke ${XRAY_CONF1} (dan ${XRAY_CONF2}). Wildcard:${WILDCARD_MODE}${WILDCARD_DOMAIN:+ , domain:${WILDCARD_DOMAIN}}"
 }
 
 # ensure log files & permissions, and run xray as root (via drop-in)
@@ -268,23 +314,35 @@ open_firewall(){
   fi
 }
 
-# payload builder & save
+# payload builder & save (respects wildcard mode/domain)
 build_payloads_and_save(){
   USER="$1"; PASS="$2"; IP="$3"; EXPI="$4"
-  SSH_PORT=22; WS_PORT=443; GRPC_PORT=8443; PATH_WS="/trojan-ws"
-  # create VMESS JSON & base64
+  SSH_PORT=22; WS_PORT=443; GRPC_PORT=8443
+  # choose path depending on wildcard mode
+  load_meta
+  if [[ "${WILDCARD_MODE}" == "on" ]]; then
+    PATH_WS="/"
+    HOST_FOR_PAYLOAD="${WILDCARD_DOMAIN:-${IP}}"
+    SNI_PARAM="${WILDCARD_DOMAIN:-}"
+  else
+    PATH_WS="/trojan-ws"
+    HOST_FOR_PAYLOAD="${IP}"
+    SNI_PARAM=""
+  fi
+
+  # create VMESS UUID
   if command -v uuidgen >/dev/null 2>&1; then VMESS_UUID=$(uuidgen); else VMESS_UUID=$(cat /proc/sys/kernel/random/uuid); fi
   VMESS_JSON=$(cat <<J
 {
   "v":"2",
   "ps":"YHDS-${USER}",
-  "add":"${IP}",
+  "add":"${HOST_FOR_PAYLOAD}",
   "port":"${WS_PORT}",
   "id":"${VMESS_UUID}",
   "aid":"0",
   "net":"ws",
   "type":"none",
-  "host":"${IP}",
+  "host":"${HOST_FOR_PAYLOAD}",
   "path":"${PATH_WS}",
   "tls":"tls"
 }
@@ -292,12 +350,19 @@ J
 )
   VMESS_BASE=$(echo -n "${VMESS_JSON}" | base64 | tr -d '\n')
   VMESS_LINK="vmess://${VMESS_BASE}"
-  VLESS_LINK="vless://${VMESS_UUID}@${IP}:${WS_PORT}?type=ws&security=tls&path=${PATH_WS}#YHDS-${USER}"
-  TROJAN_WS="trojan://${PASS}@${IP}:${WS_PORT}?path=%2F${PATH_WS#"/"}&security=tls&host=${IP}&type=ws&sni=${IP}#${USER}"
-  TROJAN_GRPC="trojan://${PASS}@${IP}:${GRPC_PORT}?mode=gun&security=tls&type=grpc&serviceName=trojan-grpc&sni=${IP}#${USER}"
-  HTTP80="${IP}:80@${USER}:${PASS}"
-  HTTP443="${IP}:443@${USER}:${PASS}"
-  UDP_RANGE="${IP}:1-65535@${USER}:${PASS}"
+  VLESS_LINK="vless://${VMESS_UUID}@${HOST_FOR_PAYLOAD}:${WS_PORT}?type=ws&security=tls&path=${PATH_WS}#YHDS-${USER}"
+  # Trojan links include sni if domain provided
+  if [[ -n "${SNI_PARAM}" ]]; then
+    TROJAN_WS="trojan://${PASS}@${HOST_FOR_PAYLOAD}:${WS_PORT}?path=%2F${PATH_WS#"/"}&security=tls&host=${HOST_FOR_PAYLOAD}&sni=${SNI_PARAM}#${USER}"
+    TROJAN_GRPC="trojan://${PASS}@${HOST_FOR_PAYLOAD}:${GRPC_PORT}?mode=gun&security=tls&type=grpc&serviceName=trojan-grpc&sni=${SNI_PARAM}#${USER}"
+  else
+    TROJAN_WS="trojan://${PASS}@${HOST_FOR_PAYLOAD}:${WS_PORT}?path=%2F${PATH_WS#"/"}&security=tls#${USER}"
+    TROJAN_GRPC="trojan://${PASS}@${HOST_FOR_PAYLOAD}:${GRPC_PORT}?mode=gun&security=tls&type=grpc&serviceName=trojan-grpc#${USER}"
+  fi
+
+  HTTP80="${HOST_FOR_PAYLOAD}:80@${USER}:${PASS}"
+  HTTP443="${HOST_FOR_PAYLOAD}:443@${USER}:${PASS}"
+  UDP_RANGE="${HOST_FOR_PAYLOAD}:1-65535@${USER}:${PASS}"
 
   OUTF="/tmp/last_yhds_payload_${USER}.txt"
   cat > "${OUTF}" <<PAY
@@ -305,7 +370,9 @@ J
 ✅ Akun dibuat: ${USER}
 Password/UUID: ${PASS}
 Expired: ${EXPI}
-Host/IP: ${IP}
+Host/IP/HostForPayload: ${HOST_FOR_PAYLOAD}
+Wildcard mode: ${WILDCARD_MODE}
+Wildcard domain: ${WILDCARD_DOMAIN}
 ===============================
 
 --- SSH / OPENSSH ---
@@ -322,12 +389,12 @@ UDP range: ${UDP_RANGE}
 --- WebSocket (WS) ---
 Port: ${WS_PORT}
 Payload:
-GET / HTTP/1.1[crlf]Host: ${IP}[crlf]Connection: Upgrade[crlf]Upgrade: websocket[crlf]User-Agent: [ua][crlf][crlf]
+GET / HTTP/1.1[crlf]Host: ${HOST_FOR_PAYLOAD}[crlf]Connection: Upgrade[crlf]Upgrade: websocket[crlf]User-Agent: [ua][crlf][crlf]
 
 --- WebSocket TLS (WSS) ---
 Port: ${WS_PORT}
 Payload:
-GET / HTTP/1.1[crlf]Host: ${IP}[crlf]Connection: Upgrade[crlf]Upgrade: websocket[crlf]User-Agent: [ua][crlf][crlf]
+GET / HTTP/1.1[crlf]Host: ${HOST_FOR_PAYLOAD}[crlf]Connection: Upgrade[crlf]Upgrade: websocket[crlf]User-Agent: [ua][crlf][crlf]
 
 --- VMESS ---
 ${VMESS_LINK}
@@ -357,7 +424,7 @@ PAY
     BOT_TOKEN=$(jq -r .token "${TG_CONF}" 2>/dev/null || echo "")
     CHAT_ID=$(jq -r .chat_id "${TG_CONF}" 2>/dev/null || echo "")
     if [[ -n "${BOT_TOKEN}" && -n "${CHAT_ID}" ]]; then
-      MSG_HTML="<b>✅ TRIAL TROJAN PREMIUM</b>%0A<pre>Username: ${USER}%0APassword: ${PASS}%0AExpired: ${EXPI}%0AHost: ${IP}</pre>%0A%0A<pre>${TROJAN_WS}</pre>%0A%0A<pre>${TROJAN_GRPC}</pre>"
+      MSG_HTML="<b>✅ TRIAL TROJAN PREMIUM</b>%0A<pre>Username: ${USER}%0APassword: ${PASS}%0AExpired: ${EXPI}%0AHost: ${HOST_FOR_PAYLOAD}</pre>%0A%0A<pre>${TROJAN_WS}</pre>%0A%0A<pre>${TROJAN_GRPC}</pre>"
       curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" -d chat_id="${CHAT_ID}" -d parse_mode="HTML" --data-urlencode "text=${MSG_HTML}" >/dev/null 2>&1 || true
       # send QR images if present
       [[ -f "/root/trojan-ws-${USER}.png" ]] && curl -s -F chat_id="${CHAT_ID}" -F photo="@/root/trojan-ws-${USER}.png" "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" >/dev/null 2>&1 || true
@@ -495,6 +562,7 @@ system_dashboard(){
   RAM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
   SWAP=$(free -h | awk '/Swap:/ {print $3 "/" $2}')
   DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
+  load_meta
   echo -e "${CYAN}╔════════════════════════════════════════════════╗${NC}"
   echo -e "${MAGENTA}║               MENU YHDS VPS PREMIUM            ║${NC}"
   echo -e "${CYAN}╠════════════════════════════════════════════════╣${NC}"
@@ -509,8 +577,44 @@ system_dashboard(){
   echo -e "${YELLOW} RAM      :${NC} $RAM"
   echo -e "${YELLOW} SWAP     :${NC} $SWAP"
   echo -e "${YELLOW} Disk     :${NC} $DISK"
+  echo -e "${YELLOW} Wildcard :${NC} ${WILDCARD_MODE} ${WILDCARD_DOMAIN:+(domain:${WILDCARD_DOMAIN})}"
   echo -e "${CYAN}╚════════════════════════════════════════════════╝${NC}"
   echo ""
+}
+
+# toggle wildcard mode helper
+toggle_wildcard_mode(){
+  load_meta
+  if [[ "${WILDCARD_MODE}" == "on" ]]; then
+    WILDCARD_MODE="off"
+    WILDCARD_DOMAIN=""
+    save_meta
+    echo "Wildcard mode dimatikan."
+  else
+    read -p "Masukkan wildcard domain (kosong untuk pakai IP saja, contoh: *.example.com) : " D
+    WILDCARD_DOMAIN="${D:-}"
+    WILDCARD_MODE="on"
+    save_meta
+    IP=$(server_ip)
+    ensure_cert_for_ip_and_domain "${IP}" "${WILDCARD_DOMAIN}"
+    write_xray_config "${IP}"
+    systemctl restart xray >/dev/null 2>&1 || true
+    echo "Wildcard mode diaktifkan. Domain:${WILDCARD_DOMAIN:-(none)}"
+  fi
+}
+
+# recreate cert (useful after setting domain)
+recreate_cert_and_reload(){
+  read -p "Masukkan wildcard domain (kosong to keep current): " D
+  if [[ -n "${D}" ]]; then
+    WILDCARD_DOMAIN="${D}"
+  fi
+  save_meta
+  IP=$(server_ip)
+  ensure_cert_for_ip_and_domain "${IP}" "${WILDCARD_DOMAIN}"
+  write_xray_config "${IP}"
+  systemctl restart xray >/dev/null 2>&1 || true
+  echo "Cert dibuat/diupdate dan xray direstart."
 }
 
 # main menu loop
@@ -518,7 +622,7 @@ main_menu(){
   ensure_deps
   prepare_dirs
   IP=$(server_ip)
-  ensure_cert_for_ip "${IP}"
+  ensure_cert_for_ip_and_domain "${IP}" "${WILDCARD_DOMAIN}"
   install_xray || true
   ensure_xray_runable
   write_xray_config "${IP}"
@@ -545,15 +649,17 @@ main_menu(){
     echo -e "10) Check Logs"
     echo -e "11) Auto Update Script"
     echo -e "12) Install / Restart Telegram Bot"
-    echo -e "13) Exit"
+    echo -e "13) Toggle Wildcard Mode (on/off)"
+    echo -e "14) Set / Recreate Wildcard Cert & Reload"
+    echo -e "15) Exit"
     echo -e "${BLUE}╚════════════════════════════════════════════════╝${NC}"
-    read -p "Pilih menu [1-13]: " MENU
+    read -p "Pilih menu [1-15]: " MENU
     case "${MENU}" in
       1) create_user_interactive ;;
       2) create_user_interactive ;;
       3) create_user_interactive ;;
       4) create_user_interactive ;;
-      5) create_v2ray_account ;;
+      5) create_v2ray_account 2>/dev/null || echo "(placeholder: belum diimplementasi)" ;;
       6) if [[ -f "${USERS_CSV}" ]]; then column -t -s, "${USERS_CSV}" || cat "${USERS_CSV}"; else echo "(belum ada user)"; fi ;;
       7) read -p "Masukkan username: " R; userdel -f "$R" 2>/dev/null || true; sed -i "/^$R,/d" "${USERS_CSV}"; write_xray_config "$(server_ip)"; systemctl restart xray >/dev/null 2>&1 || true; echo "User $R dihapus." ;;
       8) systemctl restart udp-custom && echo "UDP-Custom direstart." ;;
@@ -561,7 +667,9 @@ main_menu(){
       10) journalctl -u xray -n 200 --no-pager || true; journalctl -u udp-custom -n 200 --no-pager || true ;;
       11) read -p "Masukkan raw URL menu (atau enter skip): " REM; if [[ -n "${REM}" ]]; then wget -q -O "${MENU_PATH}" "${REM}" && chmod +x "${MENU_PATH}" && echo "Menu updated."; else echo "Skipped."; fi ;;
       12) install_telegram_bot ;;
-      13) echo "Keluar..."; exit 0 ;;
+      13) toggle_wildcard_mode ;;
+      14) recreate_cert_and_reload ;;
+      15) echo "Keluar..."; exit 0 ;;
       *) echo -e "${RED}Pilihan salah!${NC}" ;;
     esac
     echo -e "\nTekan Enter untuk kembali..."
@@ -574,6 +682,9 @@ if [[ "${1:-}" == "--create-noninteractive" ]]; then
   create_noninteractive "${2:-}" "${3:-}" "${4:-}"
   exit 0
 fi
+
+# load meta at start
+load_meta
 
 # Run main menu
 main_menu
